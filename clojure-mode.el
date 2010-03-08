@@ -6,7 +6,7 @@
 ;;          Lennart Staflin <lenst@lysator.liu.se>
 ;;          Phil Hagelberg <technomancy@gmail.com>
 ;; URL: http://www.emacswiki.org/cgi-bin/wiki/ClojureMode
-;; Version: 1.5
+;; Version: 1.6
 ;; Keywords: languages, lisp
 
 ;; This file is not part of GNU Emacs.
@@ -29,10 +29,9 @@
 ;;     Add this to your .emacs config: (require 'clojure-mode)
 ;;     Or generate autoloads with the `update-directory-autoloads' function.
 
-;; The clojure-install function can check out and configure all the
-;; dependencies get going with Clojure, including SLIME integration.
-;; To use this function, you may have to manually load clojure-mode.el
-;; using M-x load-file or M-x eval-buffer.
+;; See also the swank-clojure package for better interaction with
+;; Clojure subprocesses. Note that M-x clojure-install functionality
+;; has been moved to that package and is deprecated here.
 
 ;; Users of older Emacs (pre-22) should get version 1.4:
 ;; http://github.com/technomancy/clojure-mode/tree/1.4
@@ -81,6 +80,14 @@ restart (ie. M-x clojure-mode) of existing clojure mode buffers."
   :type 'boolean
   :group 'clojure-mode)
 
+(defcustom clojure-mode-load-command  "(clojure.core/load-file \"%s\")\n"
+  "*Format-string for building a Clojure expression to load a file.
+This format string should use `%s' to substitute a file name
+and should result in a Clojure expression that will command the inferior
+Clojure to load that file."
+  :type 'string
+  :group 'clojure-mode)
+
 (defcustom clojure-mode-use-backtracking-indent nil
   "Set to non-nil to enable backtracking/context sensitive indentation."
   :type 'boolean
@@ -94,6 +101,13 @@ restart (ie. M-x clojure-mode) of existing clojure mode buffers."
 (defvar clojure-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map lisp-mode-shared-map)
+    (define-key map "\e\C-x" 'lisp-eval-defun)
+    (define-key map "\C-x\C-e" 'lisp-eval-last-sexp)
+    (define-key map "\C-c\C-e" 'lisp-eval-last-sexp)
+    (define-key map "\C-c\C-l" 'clojure-load-file)
+    (define-key map "\C-c\C-r" 'lisp-eval-region)
+    (define-key map "\C-c\C-z" 'run-lisp)
+    (define-key map (kbd "RET") 'reindent-then-newline-and-indent)
     map)
   "Keymap for Clojure mode. Inherits from `lisp-mode-shared-map'.")
 
@@ -113,6 +127,11 @@ restart (ie. M-x clojure-mode) of existing clojure mode buffers."
 
 (define-abbrev-table 'clojure-mode-abbrev-table ())
 
+(defvar clojure-prev-l/c-dir/file nil
+  "Record last directory and file used in loading or compiling.
+This holds a cons cell of the form `(DIRECTORY . FILE)'
+describing the last `clojure-load-file' or `clojure-compile-file' command.")
+
 (defvar clojure-def-regexp "^\\s *\\((def\\S *\\s +\\(\[^ \n\t\]+\\)\\)"
   "A regular expression to match any top-level definitions.")
 
@@ -123,6 +142,8 @@ Commands:
 Delete converts tabs to spaces as it moves back.
 Blank lines separate paragraphs.  Semicolons start comments.
 \\{clojure-mode-map}
+Note that `run-lisp' may be used either to start an inferior Lisp job
+or to switch back to an existing one.
 
 Entry to this mode calls the value of `clojure-mode-hook'
 if that value is non-nil."
@@ -141,7 +162,7 @@ if that value is non-nil."
   (set (make-local-variable 'lisp-indent-function)
        'clojure-indent-function)
   (set (make-local-variable 'lisp-doc-string-elt-property)
-	   'clojure-doc-string-elt)
+       'clojure-doc-string-elt)
   (set (make-local-variable 'font-lock-multiline) t)
 
   (setq lisp-imenu-generic-expression
@@ -261,12 +282,12 @@ elements of a def* forms."
   (eval-when-compile
     `( ;; Definitions.
       (,(concat "(\\(?:clojure.core/\\)?\\("
-                (regexp-opt '("defn" "defn-"
-                              "defmulti" "defmethod"
-                              "defmacro"
-                              "deftest"
-                              "defstruct"
-                              "def" "defonce"))
+                (regexp-opt '("defn" "defn-" "def" "defonce"
+                              "defmulti" "defmethod" "defmacro"
+                              "defstruct" "deftype" "defprotocol"
+                              "defvar" "defunbound"
+                              "defalias" "defhinted"
+                              "defnk" "defn-memo"))
                 ;; Function declarations.
                 "\\)\\>"
                 ;; Any whitespace
@@ -277,6 +298,13 @@ elements of a def* forms."
                 "\\(\\sw+\\)?")
        (1 font-lock-keyword-face)
        (2 font-lock-function-name-face nil t))
+      ;; Deprecated functions
+      (,(concat
+         "(\\(?:clojure.core/\\)?"
+         (regexp-opt
+          '("add-watcher" "remove-watcher" "add-classpath") t)
+         "\\>")
+       1 font-lock-warning-face)
       ;; Control structures
       (,(concat
          "(\\(?:clojure.core/\\)?"
@@ -286,7 +314,7 @@ elements of a def* forms."
             "for" "loop" "recur"
             "when" "when-not" "when-let" "when-first"
             "if" "if-let" "if-not"
-            "." ".." "->" "doto"
+            "." ".." "->" "->>" "doto"
             "and" "or"
             "dosync" "doseq" "dotimes" "dorun" "doall"
             "load" "import" "unimport" "ns" "in-ns" "refer"
@@ -299,23 +327,107 @@ elements of a def* forms."
       (,(concat
          "(\\(?:clojure.core/\\)?"
          (regexp-opt
-          '("implement" "proxy" "lazy-cons" "with-meta"
-            "struct" "struct-map" "delay" "locking" "sync" "time" "apply"
-            "remove" "merge" "interleave" "interpose" "distinct" "for"
-            "cons" "concat" "lazy-cat" "cycle" "rest" "frest" "drop"
-            "drop-while" "nthrest" "take" "take-while" "take-nth" "butlast"
-            "reverse" "sort" "sort-by" "split-at" "partition" "split-with"
-            "first" "ffirst" "rfirst" "when-first" "zipmap" "into" "set" "vec"
-            "to-array-2d" "not-empty" "seq?" "not-every?" "every?" "not-any?"
-            "map" "mapcat" "vector?" "list?" "hash-map" "reduce" "filter"
-            "vals" "keys" "rseq" "subseq" "rsubseq" "count" "empty?"
-            "fnseq" "lazy-cons" "repeatedly" "iterate" "drop-last"
-            "repeat" "replicate" "range"  "into-array"
-            "line-seq" "resultset-seq" "re-seq" "re-find" "tree-seq" "file-seq"
-            "iterator-seq" "enumeration-seq" "declare"  "xml-seq"
-            "symbol?" "string?" "vector" "conj" "str"
-            "pos?" "neg?" "zero?" "nil?" "inc" "format"
-            "alter" "commute" "ref-set" "floor" "assoc" "send" "send-off" ) t)
+          '("*" "*1" "*2" "*3" "*agent*"
+        "*allow-unresolved-vars*" "*assert*" "*clojure-version*" "*command-line-args*" "*compile-files*"
+        "*compile-path*" "*e" "*err*" "*file*" "*flush-on-newline*"
+        "*in*" "*macro-meta*" "*math-context*" "*ns*" "*out*"
+        "*print-dup*" "*print-length*" "*print-level*" "*print-meta*" "*print-readably*"
+        "*read-eval*" "*source-path*" "*use-context-classloader*" "*warn-on-reflection*" "+"
+        "-" "/"
+        "<" "<=" "=" "==" ">"
+        ">=" "accessor" "aclone"
+        "agent" "agent-errors" "aget" "alength" "alias"
+        "all-ns" "alter" "alter-meta!" "alter-var-root" "amap"
+        "ancestors" "and" "apply" "areduce" "array-map"
+        "aset" "aset-boolean" "aset-byte" "aset-char" "aset-double"
+        "aset-float" "aset-int" "aset-long" "aset-short" "assert"
+        "assoc" "assoc!" "assoc-in" "associative?" "atom"
+        "await" "await-for" "await1" "bases" "bean"
+        "bigdec" "bigint" "binding" "bit-and" "bit-and-not"
+        "bit-clear" "bit-flip" "bit-not" "bit-or" "bit-set"
+        "bit-shift-left" "bit-shift-right" "bit-test" "bit-xor" "boolean"
+        "boolean-array" "booleans" "bound-fn" "bound-fn*" "butlast"
+        "byte" "byte-array" "bytes" "cast" "char"
+        "char-array" "char-escape-string" "char-name-string" "char?" "chars"
+        "chunk" "chunk-append" "chunk-buffer" "chunk-cons" "chunk-first"
+        "chunk-next" "chunk-rest" "chunked-seq?" "class" "class?"
+        "clear-agent-errors" "clojure-version" "coll?" "comment" "commute"
+        "comp" "comparator" "compare" "compare-and-set!" "compile"
+        "complement" "concat" "cond" "condp" "conj"
+        "conj!" "cons" "constantly" "construct-proxy" "contains?"
+        "count" "counted?" "create-ns" "create-struct" "cycle"
+        "dec" "decimal?" "declare" "definline" "defmacro"
+        "defmethod" "defmulti" "defn" "defn-" "defonce"
+        "defstruct" "delay" "delay?" "deliver" "deref"
+        "derive" "descendants" "destructure" "disj" "disj!"
+        "dissoc" "dissoc!" "distinct" "distinct?" "doall"
+        "doc" "dorun" "doseq" "dosync" "dotimes"
+        "doto" "double" "double-array" "doubles" "drop"
+        "drop-last" "drop-while" "empty" "empty?" "ensure"
+        "enumeration-seq" "eval" "even?" "every?" "false?"
+        "ffirst" "file-seq" "filter" "find" "find-doc"
+        "find-ns" "find-var" "first" "float" "float-array"
+        "float?" "floats" "flush" "fn" "fn?"
+        "fnext" "for" "force" "format" "future"
+        "future-call" "future-cancel" "future-cancelled?" "future-done?" "future?"
+        "gen-class" "gen-interface" "gensym" "get" "get-in"
+        "get-method" "get-proxy-class" "get-thread-bindings" "get-validator" "hash"
+        "hash-map" "hash-set" "identical?" "identity" "if-let"
+        "if-not" "ifn?" "import" "in-ns" "inc"
+        "init-proxy" "instance?" "int" "int-array" "integer?"
+        "interleave" "intern" "interpose" "into" "into-array"
+        "ints" "io!" "isa?" "iterate" "iterator-seq"
+        "juxt" "key" "keys" "keyword" "keyword?"
+        "last" "lazy-cat" "lazy-seq" "let" "letfn"
+        "line-seq" "list" "list*" "list?" "load"
+        "load-file" "load-reader" "load-string" "loaded-libs" "locking"
+        "long" "long-array" "longs" "loop" "macroexpand"
+        "macroexpand-1" "make-array" "make-hierarchy" "map" "map?"
+        "mapcat" "max" "max-key" "memfn" "memoize"
+        "merge" "merge-with" "meta" "method-sig" "methods"
+        "min" "min-key" "mod" "name" "namespace"
+        "neg?" "newline" "next" "nfirst" "nil?"
+        "nnext" "not" "not-any?" "not-empty" "not-every?"
+        "not=" "ns" "ns-aliases" "ns-imports" "ns-interns"
+        "ns-map" "ns-name" "ns-publics" "ns-refers" "ns-resolve"
+        "ns-unalias" "ns-unmap" "nth" "nthnext" "num"
+        "number?" "odd?" "or" "parents" "partial"
+        "partition" "pcalls" "peek" "persistent!" "pmap"
+        "pop" "pop!" "pop-thread-bindings" "pos?" "pr"
+        "pr-str" "prefer-method" "prefers" "primitives-classnames" "print"
+        "print-ctor" "print-doc" "print-dup" "print-method" "print-namespace-doc"
+        "print-simple" "print-special-doc" "print-str" "printf" "println"
+        "println-str" "prn" "prn-str" "promise" "proxy"
+        "proxy-call-with-super" "proxy-mappings" "proxy-name" "proxy-super" "push-thread-bindings"
+        "pvalues" "quot" "rand" "rand-int" "range"
+        "ratio?" "rational?" "rationalize" "re-find" "re-groups"
+        "re-matcher" "re-matches" "re-pattern" "re-seq" "read"
+        "read-line" "read-string" "reduce" "ref" "ref-history-count"
+        "ref-max-history" "ref-min-history" "ref-set" "refer" "refer-clojure"
+        "release-pending-sends" "rem" "remove" "remove-method" "remove-ns"
+        "repeat" "repeatedly" "replace" "replicate"
+        "require" "reset!" "reset-meta!" "resolve" "rest"
+        "resultset-seq" "reverse" "reversible?" "rseq" "rsubseq"
+        "second" "select-keys" "send" "send-off" "seq"
+        "seq?" "seque" "sequence" "sequential?" "set"
+        "set-validator!" "set?" "short" "short-array" "shorts"
+        "shutdown-agents" "slurp" "some" "sort" "sort-by"
+        "sorted-map" "sorted-map-by" "sorted-set" "sorted-set-by" "sorted?"
+        "special-form-anchor" "special-symbol?" "split-at" "split-with" "str"
+        "stream?" "string?" "struct" "struct-map" "subs"
+        "subseq" "subvec" "supers" "swap!" "symbol"
+        "symbol?" "sync" "syntax-symbol-anchor" "take" "take-last"
+        "take-nth" "take-while" "test" "the-ns" "time"
+        "to-array" "to-array-2d" "trampoline" "transient" "tree-seq"
+        "true?" "type" "unchecked-add" "unchecked-dec" "unchecked-divide"
+        "unchecked-inc" "unchecked-multiply" "unchecked-negate" "unchecked-remainder" "unchecked-subtract"
+        "underive" "unquote" "unquote-splicing" "update-in" "update-proxy"
+        "use" "val" "vals" "var-get" "var-set"
+        "var?" "vary-meta" "vec" "vector" "vector?"
+        "when" "when-first" "when-let" "when-not" "while"
+        "with-bindings" "with-bindings*" "with-in-str" "with-loading-context" "with-local-vars"
+        "with-meta" "with-open" "with-out-str" "with-precision" "xml-seq"
+        ) t)
          "\\>")
        1 font-lock-builtin-face)
       ;; (fn name? args ...)
@@ -326,6 +438,46 @@ elements of a def* forms."
                 "\\(\\sw+\\)?" )
        (1 font-lock-keyword-face)
        (2 font-lock-function-name-face nil t))
+      ;;Other namespaces in clojure.jar
+      (,(concat
+         "(\\(?:\.*/\\)?"
+         (regexp-opt
+          '(;clojure.inpsector
+        "atom?" "collection-tag" "get-child" "get-child-count" "inspect"
+        "inspect-table" "inspect-tree" "is-leaf" "list-model" "list-provider"
+        ;clojure.main
+        "load-script" "main" "repl" "repl-caught" "repl-exception"
+        "repl-prompt" "repl-read" "skip-if-eol" "skip-whitespace" "with-bindings"
+        ;clojure.set
+        "difference" "index" "intersection" "join" "map-invert"
+        "project" "rename" "rename-keys" "select" "union"
+        ;clojure.stacktrace
+        "e" "print-cause-trace" "print-stack-trace" "print-throwable" "print-trace-element"
+        ;clojure.template
+        "do-template" "apply-template"
+        ;clojure.test
+        "*initial-report-counters*" "*load-tests*" "*report-counters*" "*stack-trace-depth*" "*test-out*"
+        "*testing-contexts*" "*testing-vars*" "are" "assert-any" "assert-expr"
+        "assert-predicate" "compose-fixtures" "deftest" "deftest-" "file-position"
+        "function?" "get-possibly-unbound-var" "inc-report-counter" "is" "join-fixtures"
+        "report" "run-all-tests" "run-tests" "set-test" "successful?"
+        "test-all-vars" "test-ns" "test-var" "testing" "testing-contexts-str"
+        "testing-vars-str" "try-expr" "use-fixtures" "with-test" "with-test-out"
+        ;clojure.walk
+        "keywordize-keys" "macroexpand-all" "postwalk" "postwalk-demo" "postwalk-replace"
+        "prewalk" "prewalk-demo" "prewalk-replace" "stringify-keys" "walk"
+        ;clojure.xml
+        "*current*" "*sb*" "*stack*" "*state*" "attrs"
+        "content" "content-handler" "element" "emit" "emit-element"
+        ;clojure.zip
+        "append-child" "branch?" "children" "down" "edit"
+        "end?" "insert-child" "insert-left" "insert-right" "left"
+        "leftmost" "lefts" "make-node" "next" "node"
+        "path" "prev" "remove" "replace" "right"
+        "rightmost" "rights" "root" "seq-zip" "up"
+        ) t)
+         "\\>")
+       1 font-lock-type-face)
       ;; Constant values (keywords).
       ("\\<:\\(\\sw\\|#\\)+\\>" 0 font-lock-builtin-face)
       ;; Meta type annotation #^Type
@@ -338,6 +490,18 @@ elements of a def* forms."
 (put 'defn- 'clojure-doc-string-elt 2)
 (put 'defmulti 'clojure-doc-string-elt 2)
 (put 'defmacro 'clojure-doc-string-elt 2)
+
+(defun clojure-load-file (file-name)
+  "Load a Lisp file into the inferior Lisp process."
+  (interactive (comint-get-source "Load Clojure file: "
+                                  clojure-prev-l/c-dir/file
+                                  '(clojure-mode) t))
+  (comint-check-source file-name) ; Check to see if buffer needs saved.
+  (setq clojure-prev-l/c-dir/file (cons (file-name-directory file-name)
+                                        (file-name-nondirectory file-name)))
+  (comint-send-string (inferior-lisp-proc)
+                      (format clojure-mode-load-command file-name))
+  (switch-to-lisp t))
 
 (defun clojure-indent-function (indent-point state)
   "This function is the normal value of the variable `lisp-indent-function'.
@@ -555,11 +719,17 @@ is bundled up as a function so that you can call it after you've set
 (defun clojure-install (src-root)
   "Perform the initial Clojure install along with Emacs support libs.
 
-This requires git, a JVM, ant, and an active Internet connection."
+This requires git, a JVM, ant, and an active Internet connection.
+Deprecated in favour of functionality in swank-clojure."
   (interactive (list
                 (read-string (concat "Install Clojure in (default: "
                                      clojure-src-root "): ")
                              nil nil clojure-src-root)))
+
+  (when (y-or-n-p
+         "This function is deprecated in favour of swank-clojure. \
+See http://technomancy.us/swank-clojure for details. Abort? ")
+    (error "Aborted!"))
 
   (let ((orig-directory default-directory))
     (make-directory src-root t)
@@ -624,7 +794,7 @@ should be checked out in the `clojure-src-root' directory."
     (cd (format "%s/clojure-contrib" clojure-src-root))
     (unless (= 0 (shell-command "ant -Dclojure.jar=../clojure/clojure.jar"))
       (error "Couldn't compile Contrib."))
-    
+
     (message "Finished updating Clojure.")
     (cd orig-directory)))
 
